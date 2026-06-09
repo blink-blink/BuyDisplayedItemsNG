@@ -36,18 +36,42 @@ namespace Hooks {
             return setting ? setting->GetString() : "gold";
         }
 
-        static std::string make_buy_label(RE::TESObjectREFR* a_ref, const std::string& a_buyLabel) {
+        static std::string make_buy_label(RE::TESObjectREFR* a_ref) {
+            const auto& settings = Settings::GetSingleton();
             const auto count = a_ref->extraList.GetCount();
             const auto cost = Manager::GetSingleton()->GetBuyCost(a_ref);
             const auto name = a_ref->GetDisplayFullName();
+            const auto safeName = name ? name : "";
             const std::string goldLabel = get_gold_label();
 
-            const std::string header = cost > 0 ? (Manager::GetSingleton()->GetGoldValueBelowBuyVisuals()
-                                                       ? std::format("{}\n({} {})", a_buyLabel, cost, goldLabel)
-                                                       : std::format("{} ({} {})", a_buyLabel, cost, goldLabel))
-                                                : a_buyLabel;
+            std::string label;
 
-            return count > 1 ? std::format("{}\n{} ({})", header, name, count) : std::format("{}\n{}", header, name);
+            if (settings.oblivionInteractionIcons) {
+                label += "<Font face=\"Iconographia\">m</font>";
+            }
+
+            else if (!settings.buyLabel.empty()) {
+                label += settings.buyLabel;
+            }
+
+            if (cost > 0) {
+                if (settings.goldValueBelowBuyVisuals) {
+                    if (!label.empty()) label += "\n";
+                    label += std::format("{} {}", cost, goldLabel);
+                } else {
+                    if (!label.empty()) label += " ";
+                    label += std::format("{} {}", cost, goldLabel);
+                }
+            }
+
+            label += "\n";
+            label += safeName;
+
+            if (count > 1) {
+                label += std::format(" ({})", count);
+            }
+
+            return label;
         }
 
         static std::string make_take_label(RE::TESObjectREFR* a_ref) {
@@ -57,15 +81,15 @@ namespace Hooks {
             const std::string verb = setting ? setting->GetString() : (isSteal ? "Steal" : "Take");
             const auto count = a_ref->extraList.GetCount();
             const auto name = a_ref->GetDisplayFullName();
+            const auto safeName = name ? name : "";
 
-            return count > 1 ? std::format("{}\n{} ({})", verb, name, count) : std::format("{}\n{}", verb, name);
+            return count > 1 ? std::format("{}\n{} ({})", verb, safeName, count)
+                             : std::format("{}\n{}", verb, safeName);
         }
 
         static void set_player_owner(RE::TESObjectREFR* a_ref, RE::Actor* a_player) {
             auto* playerBase = a_player->GetActorBase();
-            if (!playerBase) {
-                return;
-            }
+            if (!playerBase) return;
 
             if (auto* xOwner = a_ref->extraList.GetByType<RE::ExtraOwnership>()) {
                 xOwner->owner = playerBase;
@@ -76,94 +100,73 @@ namespace Hooks {
         }
 
         static void mark_for_respawn(RE::TESObjectREFR* a_ref) {
-            if (!a_ref) {
-                return;
-            }
+            if (!a_ref) return;
             a_ref->formFlags |= static_cast<std::uint32_t>(RE::TESObjectREFR::RecordFlags::kRespawns);
         }
 
         static void give_gold_to_owner(RE::TESObjectREFR* a_ref, std::uint32_t a_cost) {
-            if (a_cost == 0 || !a_ref) {
-                return;
-            }
+            if (a_cost == 0 || !a_ref) return;
 
             const auto goldForm = RE::TESForm::LookupByID<RE::TESBoundObject>(0x0000000F);
-            if (!goldForm) {
-                return;
-            }
+            if (!goldForm) return;
 
-            RE::Actor* merchantActor = nullptr;
+            RE::ActorHandle merchantHandle{};
 
             RE::TESForm* owner = a_ref->extraList.GetOwner();
             if (owner) {
                 const auto* cell = a_ref->GetParentCell();
-                if (!cell) {
-                    return;
-                }
+                if (!cell || !cell->IsAttached()) return;
 
                 if (const auto* ownerNPC = owner->As<RE::TESNPC>()) {
                     for (const auto& refHandle : cell->GetRuntimeData().references) {
                         const auto ref = refHandle.get();
-                        if (!ref) {
-                            continue;
-                        }
+                        if (!ref || !ref->Is3DLoaded()) continue;
                         auto* actor = ref->As<RE::Actor>();
-                        if (!actor || actor->IsDead()) {
-                            continue;
-                        }
+                        if (!actor || actor->IsDead()) continue;
                         if (actor->GetActorBase() == ownerNPC) {
-                            merchantActor = actor;
+                            merchantHandle = actor->GetHandle();
                             break;
                         }
                     }
                 } else if (const auto* ownerFaction = owner->As<RE::TESFaction>()) {
                     for (const auto& refHandle : cell->GetRuntimeData().references) {
                         const auto ref = refHandle.get();
-                        if (!ref) {
-                            continue;
-                        }
+                        if (!ref || !ref->Is3DLoaded()) continue;
                         auto* actor = ref->As<RE::Actor>();
-                        if (!actor || actor->IsDead()) {
-                            continue;
-                        }
+                        if (!actor || actor->IsDead()) continue;
                         const auto* npc = actor->GetActorBase();
-                        if (!npc) {
-                            continue;
-                        }
+                        if (!npc) continue;
                         for (const auto& factionRank : npc->factions) {
                             if (factionRank.faction == ownerFaction) {
-                                merchantActor = actor;
+                                merchantHandle = actor->GetHandle();
                                 break;
                             }
                         }
-                        if (merchantActor) {
-                            break;
-                        }
+                        if (merchantHandle) break;
                     }
                 }
             } else {
-                merchantActor = Manager::GetSingleton()->FindCellMerchant(a_ref);
+                merchantHandle = Manager::GetSingleton()->FindCellMerchant(a_ref);
             }
 
-            if (merchantActor) {
-                merchantActor->AddObjectToContainer(goldForm, nullptr, static_cast<std::int32_t>(a_cost), nullptr);
-                logger::debug("Gave {} gold to merchant '{}'", a_cost, merchantActor->GetDisplayFullName());
+            const auto merchantRef = merchantHandle.get();
+            if (merchantRef) {
+                merchantRef->AddObjectToContainer(goldForm, nullptr, static_cast<std::int32_t>(a_cost), nullptr);
+                logger::debug("Gave {} gold to merchant '{}'", a_cost, merchantRef->GetDisplayFullName());
             }
         }
 
         static bool attempt_purchase(RE::Actor* a_actor, RE::TESObjectREFR* a_ref, std::int32_t a_count) {
             const auto cost = Manager::GetSingleton()->GetBuyCost(a_ref);
             const auto goldForm = RE::TESForm::LookupByID<RE::TESBoundObject>(0x0000000F);
-            if (!goldForm) {
-                return false;
-            }
+            if (!goldForm) return false;
 
             const auto playerInv = a_actor->GetInventoryCounts();
             const auto goldIt = playerInv.find(goldForm);
             const auto playerGold = (goldIt != playerInv.end()) ? static_cast<std::uint32_t>(goldIt->second) : 0u;
 
             if (playerGold < cost) {
-                RE::DebugMessageBox(Manager::GetSingleton()->GetInsufficientGoldMessage().c_str());
+                RE::SendHUDMessage::ShowHUDMessage(Settings::GetSingleton().insufficientGoldMessage.c_str());
                 return false;
             }
 
@@ -198,13 +201,11 @@ namespace Hooks {
     template <detail::GetActivateTextFunc* ResolvedGAT>
     struct GetActivateTextT {
         static bool thunk(RE::TESBoundObject* a_this, RE::TESObjectREFR* a_activator, RE::BSString& a_dst) {
-            const auto settings = Manager::GetSingleton();
-
-            if (a_activator && settings->IsVendorItem(a_activator)) {
-                if (settings->GetHotkeyPressed()) {
+            if (a_activator && Manager::GetSingleton()->IsVendorItem(a_activator)) {
+                if (Manager::GetSingleton()->GetHotkeyPressed()) {
                     return (*ResolvedGAT)(a_this, a_activator, a_dst);
                 } else {
-                    a_dst = detail::make_buy_label(a_activator, settings->GetBuyLabel());
+                    a_dst = detail::make_buy_label(a_activator);
                 }
                 return true;
             }
@@ -218,48 +219,44 @@ namespace Hooks {
     template <detail::ActivateFunc* ResolvedAct>
     struct ActivateT {
         static bool thunk(RE::TESBoundObject* a_this, RE::TESObjectREFR* a_targetRef, RE::TESObjectREFR* a_activatorRef,
-                          std::uint8_t a_arg3, RE::TESBoundObject* /*a_objectToGet*/, std::int32_t a_targetCount) {
-            if (const auto light = a_this->As<RE::TESObjectLIGH>(); light && !light->CanBeCarried()) {
-                return false;
-            }
+                          std::uint8_t a_arg3, RE::TESBoundObject* a_objectToGet, std::int32_t a_targetCount) {
+            logger::debug("Activate: this={:X} tgt={:X} act={:X}", reinterpret_cast<std::uintptr_t>(a_this),
+                          reinterpret_cast<std::uintptr_t>(a_targetRef),
+                          reinterpret_cast<std::uintptr_t>(a_activatorRef));
 
             if (!a_targetRef || !a_activatorRef) {
-                return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, nullptr, a_targetCount);
+                return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, a_objectToGet, a_targetCount);
             }
 
             const auto actor = a_activatorRef->As<RE::Actor>();
             if (!actor || !actor->IsPlayerRef()) {
-                return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, nullptr, a_targetCount);
+                return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, a_objectToGet, a_targetCount);
             }
 
-            const auto settings = Manager::GetSingleton();
-
-            if (settings->IsVendorItem(a_targetRef)) {
-                if (settings->GetHotkeyPressed()) {
-                    return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, nullptr, a_targetCount);
+            if (Manager::GetSingleton()->IsVendorItem(a_targetRef)) {
+                logger::debug("Activate: IS vendor item");
+                if (Manager::GetSingleton()->GetHotkeyPressed()) {
+                    return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, a_objectToGet, a_targetCount);
                 } else {
                     detail::attempt_purchase(actor, a_targetRef, a_targetCount);
                 }
                 return true;
             }
 
-            return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, nullptr, a_targetCount);
+            return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, a_objectToGet, a_targetCount);
         }
         static inline REL::Relocation<decltype(thunk)> func;
         static inline constexpr std::size_t idx{0x37};
     };
 
-    // Book
     template <detail::GetActivateTextFunc* ResolvedGAT>
     struct GetActivateTextBookT {
         static bool thunk(RE::TESBoundObject* a_this, RE::TESObjectREFR* a_activator, RE::BSString& a_dst) {
-            const auto settings = Manager::GetSingleton();
-
-            if (a_activator && settings->IsVendorItem(a_activator)) {
-                if (settings->GetHotkeyPressed()) {
+            if (a_activator && Manager::GetSingleton()->IsVendorItem(a_activator)) {
+                if (Manager::GetSingleton()->GetHotkeyPressed()) {
                     return (*ResolvedGAT)(a_this, a_activator, a_dst);
                 } else {
-                    a_dst = detail::make_buy_label(a_activator, settings->GetBuyLabel());
+                    a_dst = detail::make_buy_label(a_activator);
                 }
                 return true;
             }
@@ -274,6 +271,10 @@ namespace Hooks {
     struct ActivateBookT {
         static bool thunk(RE::TESBoundObject* a_this, RE::TESObjectREFR* a_targetRef, RE::TESObjectREFR* a_activatorRef,
                           std::uint8_t a_arg3, RE::TESBoundObject* a_objectToGet, std::int32_t a_targetCount) {
+            logger::debug("ActivateBook: this={:X} tgt={:X} act={:X}", reinterpret_cast<std::uintptr_t>(a_this),
+                          reinterpret_cast<std::uintptr_t>(a_targetRef),
+                          reinterpret_cast<std::uintptr_t>(a_activatorRef));
+
             if (!a_targetRef || !a_activatorRef) {
                 return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, a_objectToGet, a_targetCount);
             }
@@ -283,10 +284,9 @@ namespace Hooks {
                 return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, a_objectToGet, a_targetCount);
             }
 
-            const auto settings = Manager::GetSingleton();
-
-            if (settings->IsVendorItem(a_targetRef)) {
-                if (settings->GetHotkeyPressed()) {
+            if (Manager::GetSingleton()->IsVendorItem(a_targetRef)) {
+                logger::debug("ActivateBook: IS vendor item");
+                if (Manager::GetSingleton()->GetHotkeyPressed()) {
                     return (*ResolvedAct)(a_this, a_targetRef, a_activatorRef, a_arg3, a_objectToGet, a_targetCount);
                 } else {
                     detail::attempt_purchase(actor, a_targetRef, a_targetCount);
@@ -326,7 +326,6 @@ namespace Hooks {
     void Install() {
         logger::info("{:*^30}", "HOOKS");
 
-        // do for each hooks
         detail::capture_vtable<RE::TESObjectARMO>(detail::resolved_gat_ARMO, detail::resolved_act_ARMO,
                                                   GetActivateText_ARMO::idx, Activate_ARMO::idx);
         detail::capture_vtable<RE::TESObjectWEAP>(detail::resolved_gat_WEAP, detail::resolved_act_WEAP,

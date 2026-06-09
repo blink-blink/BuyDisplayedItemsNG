@@ -1,17 +1,25 @@
 #include "Hooks.h"
 #include "Manager.h"
+#include "NPCRegistry.h"
+#include "Settings.h"
+#include "Strings.h"
+#include "UI.h"
 
 void MessageHandler(SKSE::MessagingInterface::Message* a_message)
 {
 	switch (a_message->type) {
 	case SKSE::MessagingInterface::kPostLoad:
-		Manager::GetSingleton()->LoadSettings();
-		SKSE::AllocTrampoline(14);  // needed for StealAlarm trampoline hook
+		Settings::GetSingleton().Load();
+		Strings::Load();
+		SKSE::AllocTrampoline(14);
 		Hooks::Install();
 		break;
 	case SKSE::MessagingInterface::kDataLoaded:
 		Manager::Register();
 		Manager::GetSingleton()->BuildShopFactionCache();
+		Manager::GetSingleton()->BuildBuyPriceCache();
+		NPCRegistry::GetSingleton().BuildCache();
+		UI::Register();
 		break;
 	default:
 		break;

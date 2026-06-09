@@ -7,6 +7,8 @@
 #include "SimpleIni.h"
 
 #include <spdlog/sinks/basic_file_sink.h>
+#include <mutex>
+#include <sstream>
 #include <unordered_set>
 
 #define DLLEXPORT __declspec(dllexport)

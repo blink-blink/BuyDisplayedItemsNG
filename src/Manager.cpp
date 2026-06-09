@@ -1,70 +1,5 @@
 #include "Manager.h"
 
-void Manager::LoadSettings()
-{
-	const auto path = std::format("Data/SKSE/Plugins/{}.ini", Version::PROJECT);
-
-	CSimpleIniA ini;
-	ini.SetUnicode();
-	ini.LoadFile(path.c_str());
-
-	auto readKey = [&](const char* section, const char* key, Key defaultVal, const char* comment) -> Key {
-		const char* raw = ini.GetValue(section, key, nullptr);
-		Key val = raw ? static_cast<Key>(std::stoul(raw)) : defaultVal;
-		ini.SetValue(section, key, std::to_string(val).c_str(), comment);
-		return val;
-	};
-
-	auto readFloat = [&](const char* section, const char* key, float defaultVal, const char* comment) -> float {
-		const char* raw = ini.GetValue(section, key, nullptr);
-		float val = raw ? std::stof(raw) : defaultVal;
-		ini.SetValue(section, key, std::format("{:.2f}", val).c_str(), comment);
-		return val;
-	};
-
-	auto readBool = [&](const char* section, const char* key, bool defaultVal, const char* comment) -> bool {
-		const char* raw = ini.GetValue(section, key, nullptr);
-		bool val = raw ? (std::string(raw) == "true" || std::string(raw) == "1") : defaultVal;
-		ini.SetValue(section, key, val ? "true" : "false", comment);
-		return val;
-	};
-
-	auto readString = [&](const char* section, const char* key, const char* defaultVal, const char* comment) -> std::string {
-		const char* raw = ini.GetValue(section, key, nullptr);
-		std::string val = raw ? raw : defaultVal;
-		ini.SetValue(section, key, val.c_str(), comment);
-		return val;
-	};
-
-	hotKey = readKey("Settings", "Vanilla action hotkey", 56,
-		";Hold this key then press Activate to use vanilla Take/Steal instead of Buy.\n"
-		";Default: 56 = Left Alt\n"
-		";DXScanCodes: https://ck.uesp.net/wiki/Input_Script");
-
-	hotKeyGamePad = readKey("Settings", "Vanilla action hotkey (Gamepad)", 0,
-		";Gamepad button code for the same override. 0 = disabled.");
-
-	keyHeldDuration = readFloat("Settings", "Hotkey hold duration", 0.7f,
-		";Seconds the hotkey must be held before the 'held' state triggers.\n"
-		";Only used when UseToggleMode = false");
-
-	useToggleMode = readBool("Settings", "UseToggleMode", false,
-		";If true, the hotkey toggles between Buy and Take/Steal modes.\n"
-		";If false, the hotkey must be held (with hold duration).");
-
-	buyLabel = readString("Settings", "Buy label", "Buy",
-		";Text shown on the crosshair prompt for purchasable items.");
-
-	insufficientGoldMessage = readString("Settings", "Insufficient gold message", "You don't have enough gold.",
-		";Message shown when the player cannot afford a vendor item.");
-
-	goldValueBelowBuyVisuals = readBool("Settings", "Gold Value Below Buy Visuals", false,
-		";If true, the gold cost is displayed on its own line below the buy label.\n"
-		";If false, the gold cost is displayed on the same line as the buy label.");
-
-	ini.SaveFile(path.c_str());
-}
-
 void Manager::Register()
 {
 	logger::info("{:*^30}", "EVENTS");
@@ -82,9 +17,7 @@ void Manager::Register()
 
 bool Manager::IsMerchantNPC(RE::TESNPC* a_npc) const
 {
-	if (!a_npc) {
-		return false;
-	}
+	if (!a_npc) return false;
 
 	const auto innkeeperFaction = RE::TESForm::LookupByID<RE::TESFaction>(kJobInnkeeperFactionID);
 	const auto innServerFaction = RE::TESForm::LookupByID<RE::TESFaction>(kJobInnServerFactionID);
@@ -92,9 +25,7 @@ bool Manager::IsMerchantNPC(RE::TESNPC* a_npc) const
 
 	for (const auto& factionRank : a_npc->factions) {
 		const auto faction = factionRank.faction;
-		if (!faction) {
-			continue;
-		}
+		if (!faction) continue;
 		if ((innkeeperFaction && faction == innkeeperFaction) ||
 			(innServerFaction && faction == innServerFaction) ||
 			(merchantFaction  && faction == merchantFaction)) {
@@ -107,75 +38,201 @@ bool Manager::IsMerchantNPC(RE::TESNPC* a_npc) const
 
 bool Manager::IsShopFaction(RE::TESFaction* a_faction) const
 {
-	if (!a_faction) {
-		return false;
-	}
+	if (!a_faction) return false;
 	return shopFactionCache.contains(a_faction->GetFormID());
+}
+
+bool Manager::IsBlacklistedNPC(RE::TESNPC* a_npc) const
+{
+	const auto& settings = Settings::GetSingleton();
+	if (!a_npc || settings.blacklistedNPCs.empty()) return false;
+
+	const char* rawName = a_npc->GetFullName();
+	if (!rawName || rawName[0] == '\0') return false;
+
+	for (const auto& pattern : settings.blacklistedNPCs) {
+		std::string lowerName(rawName);
+		std::string lowerPattern = pattern;
+		std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		std::transform(lowerPattern.begin(), lowerPattern.end(), lowerPattern.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (lowerName.find(lowerPattern) != std::string::npos) return true;
+	}
+
+	return false;
+}
+
+void Manager::RequestBlacklistRebuild()
+{
+	std::lock_guard lock(cacheMutex);
+	cacheDirty = true;
+	SKSE::GetTaskInterface()->AddTask([this]() {
+		BuildShopFactionCache();
+	});
 }
 
 void Manager::BuildShopFactionCache()
 {
+	std::lock_guard lock(cacheMutex);
 	logger::info("{:*^30}", "CACHE");
 
 	const auto dataHandler = RE::TESDataHandler::GetSingleton();
-	if (!dataHandler) {
-		return;
-	}
+	if (!dataHandler) return;
 
-	std::uint32_t npcCount     = 0;
-	std::uint32_t factionCount = 0;
+	shopFactionCache.clear();
+	blacklistedFactionCache.clear();
+	blacklistedNPCCache.clear();
 
-	for (const auto& npcForm : dataHandler->GetFormArray<RE::TESNPC>()) {
-		if (!npcForm) {
-			continue;
-		}
+	std::uint32_t npcCount         = 0;
+	std::uint32_t factionCount     = 0;
+	std::uint32_t blacklistedNPCs  = 0;
+	std::uint32_t blacklistedFacts = 0;
 
-		if (IsMerchantNPC(npcForm)) {
-			npcCount++;
-			for (const auto& factionRank : npcForm->factions) {
-				if (factionRank.faction) {
-					const auto id = factionRank.faction->GetFormID();
-					if (!shopFactionCache.contains(id)) {
-						shopFactionCache.insert(id);
-						factionCount++;
-					}
+	for (const auto& pattern : Settings::GetSingleton().blacklistedNPCs) {
+		auto* resolvedNPC = RE::TESForm::LookupByEditorID<RE::TESNPC>(pattern);
+		if (resolvedNPC && IsMerchantNPC(resolvedNPC)) {
+			blacklistedNPCCache.insert(resolvedNPC->GetFormID());
+			blacklistedNPCs++;
+			for (const auto& factionRank : resolvedNPC->factions) {
+				if (!factionRank.faction) continue;
+				const auto id = factionRank.faction->GetFormID();
+				if (!blacklistedFactionCache.contains(id)) {
+					blacklistedFactionCache.insert(id);
+					blacklistedFacts++;
 				}
 			}
 		}
 	}
 
-	logger::info("Shop faction cache built: {} merchant NPCs, {} factions cached",
-		npcCount, factionCount);
+	for (const auto& npcForm : dataHandler->GetFormArray<RE::TESNPC>()) {
+		if (!npcForm || !IsMerchantNPC(npcForm)) continue;
+
+		npcCount++;
+
+		const bool blacklisted = IsBlacklistedNPC(npcForm);
+
+		if (blacklisted) {
+			logger::info("Blacklisted NPC: '{}' editorID='{}' form={:08X}", npcForm->GetFullName(), npcForm->GetFormEditorID(), npcForm->GetFormID());
+			blacklistedNPCCache.insert(npcForm->GetFormID());
+			blacklistedNPCs++;
+		}
+
+		for (const auto& factionRank : npcForm->factions) {
+			if (!factionRank.faction) continue;
+			const auto id = factionRank.faction->GetFormID();
+			if (!shopFactionCache.contains(id)) {
+				shopFactionCache.insert(id);
+				factionCount++;
+			}
+			if (blacklisted && !blacklistedFactionCache.contains(id)) {
+				blacklistedFactionCache.insert(id);
+				blacklistedFacts++;
+			}
+		}
+	}
+
+	cacheDirty = false;
+
+	logger::info("Shop faction cache built: {} merchant NPCs, {} factions cached", npcCount, factionCount);
+	logger::info("Blacklist cache built: {} blacklisted NPCs, {} blacklisted factions", blacklistedNPCs, blacklistedFacts);
 }
 
-bool Manager::IsVendorItem(RE::TESObjectREFR* a_ref) const
+void Manager::BuildBuyPriceCache()
 {
-	if (!a_ref) {
+	buyPriceCache.clear();
+
+	const auto dataHandler = RE::TESDataHandler::GetSingleton();
+	if (!dataHandler) return;
+
+	for (const auto& perkForm : dataHandler->GetFormArray<RE::BGSPerk>()) {
+		if (!perkForm) continue;
+		for (auto& entry : perkForm->perkEntries) {
+			if (entry->GetType() != RE::PERK_ENTRY_TYPE::kEntryPoint) continue;
+			const auto epEntry = static_cast<RE::BGSEntryPointPerkEntry*>(entry);
+			if (epEntry->entryData.entryPoint != RE::BGSEntryPoint::ENTRY_POINTS::kModBuyPrices) continue;
+			if (!epEntry->functionData) continue;
+			const auto oneVal = static_cast<RE::BGSEntryPointFunctionDataOneValue*>(epEntry->functionData);
+			buyPriceCache.push_back({ perkForm->GetFormID(), oneVal->data, static_cast<std::uint8_t>(*epEntry->entryData.function), entry->header.rank });
+		}
+	}
+
+	logger::info("Buy price cache built: {} perk entries from {} perks", buyPriceCache.size(),
+		[&]() { std::unordered_set<RE::FormID> unique; for (auto& c : buyPriceCache) unique.insert(c.perkID); return unique.size(); }());
+}
+
+bool Manager::IsVendorItem(RE::TESObjectREFR* a_ref)
+{
+	if (!a_ref) return false;
+
+	const auto& settings = Settings::GetSingleton();
+
+	if (settings.enableSideHustle) {
+		if (!a_ref->IsCrimeToActivate()) return false;
+
+		const auto player     = RE::PlayerCharacter::GetSingleton();
+		const auto playerBase = player ? player->GetActorBase() : nullptr;
+
+		auto isNonPlayerOwner = [&](RE::TESForm* owner) -> bool {
+			if (!owner) return false;
+			if (const auto npc = owner->As<RE::TESNPC>()) {
+				return playerBase ? npc != playerBase : true;
+			}
+			if (owner->As<RE::TESFaction>()) return true;
+			return false;
+		};
+
+		if (isNonPlayerOwner(a_ref->extraList.GetOwner())) return true;
+		if (isNonPlayerOwner(a_ref->GetActorOwner())) return true;
+		if (const auto* cell = a_ref->GetParentCell()) {
+			if (isNonPlayerOwner(const_cast<RE::TESObjectCELL*>(cell)->GetOwner())) return true;
+		}
+
 		return false;
+	}
+
+	{
+		std::lock_guard lock(cacheMutex);
+		if (cacheDirty) return false;
+	}
+
+	if (settings.enableDistanceToMerchant && settings.maxDistanceToMerchant > 0.0f) {
+		const auto merchant = FindCellMerchant(a_ref);
+		const auto merchantRef = merchant.get();
+		if (merchantRef && merchantRef->Is3DLoaded()) {
+			const float dist = a_ref->GetPosition().GetDistance(merchantRef->GetPosition());
+			if (dist > settings.maxDistanceToMerchant) return false;
+		}
 	}
 
 	if (const auto owner = a_ref->extraList.GetOwner()) {
 		if (const auto npc = owner->As<RE::TESNPC>()) {
+			const auto id = npc->GetFormID();
+			if (blacklistedNPCCache.contains(id)) return false;
 			return IsMerchantNPC(npc);
 		}
 		if (const auto faction = owner->As<RE::TESFaction>()) {
-			return IsShopFaction(faction);
+			const auto id = faction->GetFormID();
+			if (blacklistedFactionCache.contains(id)) return false;
+			return shopFactionCache.contains(id);
 		}
 	}
 
 	if (const auto actorOwner = a_ref->GetActorOwner()) {
 		if (const auto npc = actorOwner->As<RE::TESNPC>()) {
+			const auto id = npc->GetFormID();
+			if (blacklistedNPCCache.contains(id)) return false;
 			return IsMerchantNPC(npc);
 		}
 	}
 
 	auto* cell = a_ref->GetParentCell();
-	if (cell) {
+	if (cell && cell->IsAttached()) {
 		if (const auto* cellOwner = cell->GetOwner()) {
-			if (cellOwner->As<RE::TESFaction>()) {
-				if (FindCellMerchant(a_ref)) {
-					return true;
-				}
+			if (const auto faction = cellOwner->As<RE::TESFaction>()) {
+				const auto id = faction->GetFormID();
+				if (blacklistedFactionCache.contains(id)) return false;
+				return shopFactionCache.contains(id);
 			}
 		}
 	}
@@ -183,67 +240,49 @@ bool Manager::IsVendorItem(RE::TESObjectREFR* a_ref) const
 	return false;
 }
 
-RE::Actor* Manager::FindCellMerchant(RE::TESObjectREFR* a_ref) const
+RE::ActorHandle Manager::FindCellMerchant(RE::TESObjectREFR* a_ref) const
 {
-	if (!a_ref) {
-		return nullptr;
-	}
+	if (!a_ref) return {};
 
 	auto* cell = a_ref->GetParentCell();
-	if (!cell) {
-		return nullptr;
-	}
+	if (!cell || !cell->IsAttached()) return {};
 
 	const auto* cellOwner = cell->GetOwner();
-	if (!cellOwner) {
-		return nullptr;
-	}
+	if (!cellOwner) return {};
 
 	const auto* ownerFaction = cellOwner->As<RE::TESFaction>();
-	if (!ownerFaction) {
-		return nullptr;
-	}
+	if (!ownerFaction) return {};
 
 	for (const auto& refHandle : cell->GetRuntimeData().references) {
 		const auto ref = refHandle.get();
-		if (!ref) { continue; }
+		if (!ref || !ref->Is3DLoaded()) continue;
 		auto* actor = ref->As<RE::Actor>();
-		if (!actor || actor->IsDead()) { continue; }
+		if (!actor || actor->IsDead()) continue;
 		auto* npc = actor->GetActorBase();
-		if (!npc) { continue; }
-		if (!IsMerchantNPC(npc)) { continue; }
+		if (!npc || !IsMerchantNPC(npc)) continue;
 		for (const auto& factionRank : npc->factions) {
-			if (factionRank.faction == ownerFaction) {
-				return actor;
-			}
+			if (factionRank.faction == ownerFaction) return actor->GetHandle();
 		}
 	}
 
-	return nullptr;
+	return {};
 }
 
 std::uint32_t Manager::GetBuyCost(RE::TESObjectREFR* a_ref) const
 {
-	if (!a_ref) {
-		return 0;
-	}
+	if (!a_ref) return 0;
 	const auto base = a_ref->GetBaseObject();
-	if (!base) {
-		return 0;
-	}
+	if (!base) return 0;
 	const auto bounded = base->As<RE::TESBoundObject>();
-	if (!bounded) {
-		return 0;
-	}
+	if (!bounded) return 0;
 
 	const std::uint32_t baseVal = bounded->GetGoldValue() > 0 ? bounded->GetGoldValue() : 1;
 
-	auto* settings = RE::GameSettingCollection::GetSingleton();
-
-	auto* barterMaxSetting = settings->GetSetting("fBarterMax");
-	auto* barterMinSetting = settings->GetSetting("fBarterMin");
-	const float barterMax  = barterMaxSetting ? barterMaxSetting->GetFloat() : 3.3f;
-	const float barterMin  = barterMinSetting ? barterMinSetting->GetFloat() : 2.0f;
+	auto* gameSettings = RE::GameSettingCollection::GetSingleton();
+	auto* barterMaxSetting = gameSettings->GetSetting("fBarterMax");
+	auto* barterMinSetting = gameSettings->GetSetting("fBarterMin");
+	const float barterMax = barterMaxSetting ? barterMaxSetting->GetFloat() : 3.3f;
+	const float barterMin = barterMinSetting ? barterMinSetting->GetFloat() : 2.0f;
 
 	const auto  player = RE::PlayerCharacter::GetSingleton();
 	const float speech = (player && player->AsActorValueOwner())
@@ -253,41 +292,89 @@ std::uint32_t Manager::GetBuyCost(RE::TESObjectREFR* a_ref) const
 	const float skillCapped     = speech < 100.0f ? speech : 100.0f;
 	const float basePriceFactor = barterMax - (barterMax - barterMin) * (skillCapped / 100.0f);
 
+	float entryPointModifier = 1.0f;
+	if (player) {
+		struct ModVisitor : RE::PerkEntryVisitor {
+		float* mod;
+			int count;
+			float minMult = 2.0f;
+			const RE::FormID allureID = 0x00058F64;
+			const RE::FormID loversInsightID = 0x00058F65;
+			float allureMult = 1.0f;
+			ModVisitor(float* m) : mod(m), count(0), minMult(2.0f), allureMult(1.0f) {}
+			RE::BSContainer::ForEachResult Visit(RE::BGSPerkEntry* e) override {
+				count++;
+				if (e->GetType() != RE::PERK_ENTRY_TYPE::kEntryPoint) return RE::BSContainer::ForEachResult::kContinue;
+				auto* ep = static_cast<RE::BGSEntryPointPerkEntry*>(e);
+				if (ep->entryData.entryPoint != RE::BGSEntryPoint::ENTRY_POINTS::kModBuyPrices) return RE::BSContainer::ForEachResult::kContinue;
+				if (!ep->functionData || !ep->perk) return RE::BSContainer::ForEachResult::kContinue;
+				auto* fdata = static_cast<RE::BGSEntryPointFunctionDataOneValue*>(ep->functionData);
+				const auto funcType = static_cast<std::uint8_t>(*ep->entryData.function);
+				if (funcType != 3) return RE::BSContainer::ForEachResult::kContinue;
+				const auto pid = ep->perk->GetFormID();
+				if (pid == allureID || pid == loversInsightID) {
+					if (fdata->data < allureMult) allureMult = fdata->data;
+				} else {
+					if (fdata->data < minMult) minMult = fdata->data;
+				}
+				return RE::BSContainer::ForEachResult::kContinue;
+			}
+		};
+		ModVisitor v{&entryPointModifier};
+		player->ForEachPerkEntry(RE::BGSEntryPoint::ENTRY_POINTS::kModBuyPrices, v);
+		if (v.minMult < 1.0f) entryPointModifier = v.minMult;
+		if (v.allureMult < 1.0f) entryPointModifier *= v.allureMult;
+		static bool s_logged = false;
+		if (!s_logged && entryPointModifier != 1.0f) {
+			logger::info("Buy price perk modifier: {:.4f}", entryPointModifier);
+			s_logged = true;
+		}
+
+		const float fbMod = player->AsActorValueOwner()->GetActorValue(RE::ActorValue::kSpeechcraftModifier);
+		if (fbMod > 0.0f) {
+			entryPointModifier *= 1.0f - (std::min)(fbMod, 100.0f) / 100.0f;
+		}
+	}
+
 	const auto          rawCount = a_ref->extraList.GetCount();
 	const std::uint32_t count    = static_cast<std::uint32_t>(rawCount > 1 ? rawCount : 1);
 
-	const float unitPrice = static_cast<float>(baseVal) * basePriceFactor;
-	return static_cast<std::uint32_t>(std::round(unitPrice)) * count;
+	const float finalPrice = static_cast<float>(baseVal) * basePriceFactor * entryPointModifier * Settings::GetSingleton().priceMultiplier;
+	return static_cast<std::uint32_t>((std::max)(std::round(finalPrice), 1.0f)) * count;
 }
 
-Key                Manager::GetHotkey() const { return hotKey; }
-Key                Manager::GetHotkeyGamePad() const { return hotKeyGamePad; }
-float              Manager::GetKeyHeldDuration() const { return keyHeldDuration; }
-bool               Manager::GetUseToggleMode() const { return useToggleMode; }
-const std::string& Manager::GetBuyLabel() const { return buyLabel; }
-const std::string& Manager::GetInsufficientGoldMessage() const { return insufficientGoldMessage; }
-bool               Manager::GetGoldValueBelowBuyVisuals() const { return goldValueBelowBuyVisuals; }
-bool               Manager::GetHotkeyPressed() const { return keyPressed; }
-void               Manager::SetHotkeyPressed(bool a_pressed) { keyPressed = a_pressed; }
-bool               Manager::GetHotkeyHeld() const { return keyHeld; }
-void               Manager::SetHotkeyHeld(bool a_held) { keyHeld = a_held; }
+bool Manager::GetHotkeyPressed() const { return keyPressed; }
+void Manager::SetHotkeyPressed(bool a_pressed) { keyPressed = a_pressed; }
+bool Manager::GetHotkeyHeld() const { return keyHeld; }
+void Manager::SetHotkeyHeld(bool a_held) { keyHeld = a_held; }
 
-void Manager::UpdateCrosshairs()
-{
-	if (const auto crossHairPickData = RE::CrosshairPickData::GetSingleton()) {
-		if (crossHairPickData->target) {
-			RE::PlayerCharacter::GetSingleton()->UpdateCrosshairs();
-		}
-	}
+void Manager::UpdateCrosshairs() {
+    if (const auto crossHairPickData = RE::CrosshairPickData::GetSingleton()) {
+#if defined(EXCLUSIVE_SKYRIM_FLAT)
+        const bool hasTarget = crossHairPickData->target.get() != nullptr;
+#else
+        const bool hasTarget = [&]() {
+            for (std::uint32_t i = 0; i < RE::VR_DEVICE::kTotal; ++i) {
+                if (crossHairPickData->target[i].get()) return true;
+            }
+            return false;
+        }();
+#endif
+        if (hasTarget) {
+            RE::PlayerCharacter::GetSingleton()->UpdateCrosshairs();
+        }
+    }
 }
 
 RE::BSEventNotifyControl Manager::ProcessEvent(const RE::MenuOpenCloseEvent* a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*)
 {
-	if (!a_event || a_event->opening) {
-		return RE::BSEventNotifyControl::kContinue;
-	}
+	if (!a_event || a_event->opening) return RE::BSEventNotifyControl::kContinue;
 
-	if (!useToggleMode) {
+	logger::debug("MenuCloseEvent: menuName={}", a_event->menuName.c_str());
+
+	const auto& settings = Settings::GetSingleton();
+
+	if (!settings.enableToggleMode) {
 		SetHotkeyPressed(false);
 		SetHotkeyHeld(false);
 		UpdateCrosshairs();
@@ -298,41 +385,44 @@ RE::BSEventNotifyControl Manager::ProcessEvent(const RE::MenuOpenCloseEvent* a_e
 
 RE::BSEventNotifyControl Manager::ProcessEvent(RE::InputEvent* const* a_evn, RE::BSTEventSource<RE::InputEvent*>*)
 {
-	if (!a_evn) {
-		return RE::BSEventNotifyControl::kContinue;
-	}
+	if (!a_evn) return RE::BSEventNotifyControl::kContinue;
 
 	const auto player = RE::PlayerCharacter::GetSingleton();
-	if (!player || !player->Is3DLoaded()) {
+	if (!player || !player->Is3DLoaded()) return RE::BSEventNotifyControl::kContinue;
+
+	if (const auto skyrimUI = RE::UI::GetSingleton();
+		!skyrimUI || skyrimUI->IsMenuOpen(RE::Console::MENU_NAME) || skyrimUI->GameIsPaused()) {
 		return RE::BSEventNotifyControl::kContinue;
 	}
 
-	if (const auto UI = RE::UI::GetSingleton();
-		!UI || UI->IsMenuOpen(RE::Console::MENU_NAME) || UI->GameIsPaused()) {
-		return RE::BSEventNotifyControl::kContinue;
+	const auto& settings = Settings::GetSingleton();
+
+	if (settings.crouchForVanillaAction) {
+		bool isSneaking = player->IsSneaking();
+		if (isSneaking != keyHeld.load()) {
+			SetHotkeyPressed(isSneaking);
+			SetHotkeyHeld(isSneaking);
+			UpdateCrosshairs();
+		}
 	}
 
 	for (auto event = *a_evn; event; event = event->next) {
 		if (const auto buttonEvent = event->AsButtonEvent()) {
 			const auto device = event->GetDevice();
-			auto       key    = buttonEvent->GetIDCode();
+			const auto key    = [&]() -> std::uint32_t {
+				auto k = buttonEvent->GetIDCode();
+				switch (device) {
+				case RE::INPUT_DEVICE::kMouse: return k + 256;
+				case RE::INPUT_DEVICE::kGamepad: return SKSE::InputMap::GamepadMaskToKeycode(k);
+				default: return k;
+				}
+			}();
 
-			switch (device) {
-			case RE::INPUT_DEVICE::kMouse:
-				key += SKSE::InputMap::kMacro_MouseButtonOffset;
-				break;
-			case RE::INPUT_DEVICE::kGamepad:
-				key = SKSE::InputMap::GamepadMaskToKeycode(key);
-				break;
-			default:
-				break;
-			}
-
-			const bool matchesKey = (key == GetHotkey()) ||
-			                        (device == RE::INPUT_DEVICE::kGamepad && key == GetHotkeyGamePad());
+			const bool matchesKey = (settings.keyboardHotkey != 0 && key == settings.keyboardHotkey) ||
+			                        (device == RE::INPUT_DEVICE::kGamepad && settings.gamepadHotkey != 0 && key == settings.gamepadHotkey);
 
 			if (matchesKey) {
-				if (useToggleMode) {
+				if (settings.enableToggleMode) {
 					if (buttonEvent->IsPressed() && !buttonEvent->IsRepeating()) {
 						toggleActive = !toggleActive;
 						SetHotkeyPressed(toggleActive);
@@ -342,12 +432,10 @@ RE::BSEventNotifyControl Manager::ProcessEvent(RE::InputEvent* const* a_evn, RE:
 				} else {
 					if (GetHotkeyPressed() != buttonEvent->IsPressed()) {
 						SetHotkeyPressed(buttonEvent->IsPressed());
-						if (!buttonEvent->IsPressed()) {
-							SetHotkeyHeld(false);
-						}
+						if (!buttonEvent->IsPressed()) SetHotkeyHeld(false);
 						UpdateCrosshairs();
 					} else if (GetHotkeyPressed() && !GetHotkeyHeld() &&
-					           buttonEvent->HeldDuration() > GetKeyHeldDuration()) {
+					           buttonEvent->HeldDuration() > 0.7f) {
 						SetHotkeyHeld(true);
 						UpdateCrosshairs();
 					} else if (!buttonEvent->IsPressed()) {
